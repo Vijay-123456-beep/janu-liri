@@ -121,7 +121,7 @@ class OverlayApp:
         payload = {
             "contents": [{
                 "parts": [
-                    {"text": "Analyze this aptitude multiple-choice question and return only the correct answer and a short explanation."},
+                    {"text": "Read the question from the image. If the question asks for code, generate the complete Java code solution. If it is an MCQ, return the correct option with explanation."},
                     {"inline_data": {"mime_type": "image/png", "data": image_data}}
                 ]
             }]
