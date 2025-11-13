@@ -31,14 +31,13 @@ class OverlayApp:
         self.root.wm_attributes("-transparentcolor", "white")
         self.root.config(bg='white')
 
-        self.text_label = tk.Label(
-            root,
-            text="Press Hotkeys to Operate",
-            font=("Helvetica", 12),
-            bg="lightgray",
-            wraplength=580
-        )
-        self.text_label.pack(expand=True, fill="both")
+        # ✅ Scrollable Text Output
+        self.text_area = tk.Text(root, font=("Helvetica", 11), wrap="word", bg="#e8e8e8")
+        self.text_area.pack(side="left", fill="both", expand=True)
+
+        self.scroll = tk.Scrollbar(root, command=self.text_area.yview)
+        self.scroll.pack(side="right", fill="y")
+        self.text_area.configure(yscrollcommand=self.scroll.set)
 
         self.visible = True
         self.last_capture_path = None
@@ -113,7 +112,7 @@ class OverlayApp:
             self.update_text("Error: Missing API Key. Add it in .env file.")
             return
 
-        self.update_text("Processing with Gemini...")
+        self.update_text("Processing with Gemini...\n")
 
         with open(self.last_capture_path, "rb") as image_file:
             image_data = base64.b64encode(image_file.read()).decode('utf-8')
@@ -121,7 +120,14 @@ class OverlayApp:
         payload = {
             "contents": [{
                 "parts": [
-                    {"text": "Read the question from the image. If the question asks for code, generate the complete Java code solution. If it is an MCQ, return the correct option with explanation."},
+                    {"text": (
+                        "Read the question from the image. "
+                        "If the question asks for a coding solution, detect the programming language automatically. "
+                        "If it is a Java question, return ONLY the valid Java code. "
+                        "If it is a Python question, return ONLY the valid Python code. "
+                        "Do not include any explanation, comments, or extra text. "
+                        "If it is an MCQ question, return ONLY the correct option letter (A/B/C/D) and its option text."
+                    )},
                     {"inline_data": {"mime_type": "image/png", "data": image_data}}
                 ]
             }]
@@ -129,17 +135,27 @@ class OverlayApp:
 
         headers = {"Content-Type": "application/json"}
 
+        # ✅ Try up to 5 times if API temporarily fails
         for attempt in range(5):
             try:
                 response = requests.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={GEMINI_API_KEY}",
                     headers=headers,
-                    json=payload
+                    json=payload,
+                    timeout=30
                 )
 
+                # Handle rate limits
                 if response.status_code == 429:
                     wait = 2 ** attempt
-                    self.update_text(f"Rate limit hit. Retrying in {wait} sec...")
+                    self.update_text(f"Rate limit hit. Retrying in {wait} sec...\n")
+                    time.sleep(wait)
+                    continue
+
+                # Handle server downtime (503)
+                if response.status_code == 503:
+                    wait = (attempt + 1) * 3
+                    self.update_text(f"Server busy (503). Retrying in {wait} seconds...\n")
                     time.sleep(wait)
                     continue
 
@@ -147,39 +163,55 @@ class OverlayApp:
                 data = response.json()
                 answer_text = data['candidates'][0]['content']['parts'][0]['text']
 
-                # ✅ Log usage
+                # ✅ Log success
                 self.log_usage()
-
-                # ✅ Get stats
                 today_count, month_count, last_90_count = self.get_usage_stats()
 
-                # ✅ Estimated free quota
-                MONTHLY_LIMIT = 1000
-                remaining = MONTHLY_LIMIT - month_count
-                percentage = max(0, (remaining / MONTHLY_LIMIT) * 100)
-
-                if remaining < 50:
-                    quota_message = f"⚠ LOW QUOTA: {remaining} req left ({percentage:.1f}% remaining)"
-                else:
-                    quota_message = f"✅ Remaining quota: {remaining} req ({percentage:.1f}%)"
-
                 display = (
-                    f"✅ Answer: {answer_text}\n\n"
-                    f"📊 Usage Stats:\n"
-                    f"➡ Today: {today_count}\n"
-                    f"➡ This Month: {month_count}\n"
-                    f"➡ Last 90 Days: {last_90_count}\n\n"
-                    f"{quota_message}"
+                    f"{answer_text}\n\n"
+                    f"--- API Usage ---\n"
+                    f"Today: {today_count}\n"
+                    f"Month: {month_count}\n"
+                    f"90 Days: {last_90_count}\n"
                 )
 
                 self.update_text(display)
                 return
 
             except Exception as e:
-                self.update_text(f"Error: {str(e)}")
-                return
+                self.update_text(f"Error: {str(e)}\nRetrying...\n")
+                time.sleep(3)
 
-        self.update_text("Failed after multiple retries. Try again later.")
+        # ✅ Fallback to Flash model if Pro keeps failing
+        try:
+            self.update_text("Switching to backup model (gemini-1.5-flash)...\n")
+
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            answer_text = data['candidates'][0]['content']['parts'][0]['text']
+
+            self.log_usage()
+            today_count, month_count, last_90_count = self.get_usage_stats()
+
+            display = (
+                f"{answer_text}\n\n"
+                f"--- API Usage ---\n"
+                f"Today: {today_count}\n"
+                f"Month: {month_count}\n"
+                f"90 Days: {last_90_count}\n"
+                f"(⚡ Flash model was used as backup)"
+            )
+            self.update_text(display)
+
+        except Exception as e:
+            self.update_text("❌ Server unavailable. Please try again later.")
+            return
 
     def refresh(self):
         self.update_text("Overlay refreshed. Ready.")
@@ -188,8 +220,9 @@ class OverlayApp:
             self.last_capture_path = None
 
     def update_text(self, message):
-        self.text_label.config(text=message)
-
+        self.text_area.delete("1.0", tk.END)
+        self.text_area.insert(tk.END, message)
+        self.text_area.see(tk.END)  # auto scroll to bottom
 
 if __name__ == "__main__":
     root = tk.Tk()
