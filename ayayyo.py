@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 # --- LOAD THE API KEY FROM .env ---
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 SCREENSHOT_FILENAME = "capture.png"
 USAGE_FILE = "usage_log.txt"
@@ -108,60 +108,116 @@ class OverlayApp:
             self.update_text("Error: Capture a screenshot first (Ctrl+Alt+C).")
             return
 
-        if not GEMINI_API_KEY:
-            self.update_text("Error: Missing API Key. Add it in .env file.")
+        if not OPENROUTER_API_KEY:
+            self.update_text("❌ Error: Missing OPENROUTER_API_KEY in .env file.\n\nGet a free key from: https://openrouter.ai/keys")
             return
 
-        self.update_text("Processing with Gemini...\n")
+        self.update_text("Processing with OpenRouter...\n")
+
+        # Check screenshot file
+        try:
+            file_size = os.path.getsize(self.last_capture_path)
+            self.update_text(f"Screenshot size: {file_size} bytes\n")
+            
+            if file_size == 0:
+                self.update_text("Error: Screenshot file is empty!\n")
+                return
+            
+            if file_size > 20 * 1024 * 1024:  # 20MB limit
+                self.update_text("Error: Screenshot too large (>20MB)\n")
+                return
+        except Exception as e:
+            self.update_text(f"Error checking screenshot: {str(e)}\n")
+            return
 
         with open(self.last_capture_path, "rb") as image_file:
             image_data = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        self.update_text(f"Image data encoded: {len(image_data)} chars\n")
 
         payload = {
-            "contents": [{
-                "parts": [
-                    {"text": (
-                        "Read the question from the image. "
-                        "If the question asks for a coding solution, detect the programming language automatically. "
-                        "If it is a Java question, return ONLY the valid Java code. "
-                        "If it is a Python question, return ONLY the valid Python code. "
-                        "Do not include any explanation, comments, or extra text. "
-                        "If it is an MCQ question, return ONLY the correct option letter (A/B/C/D) and its option text."
-                    )},
-                    {"inline_data": {"mime_type": "image/png", "data": image_data}}
+            "model": "nvidia/nemotron-nano-12b-v2-vl:free",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Analyze this image and answer the question shown. Provide a concise answer."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}}
                 ]
             }]
         }
 
-        headers = {"Content-Type": "application/json"}
-
-        # ✅ Try up to 5 times if API temporarily fails
-        for attempt in range(5):
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "HTTP-Referer": "https://openrouter.ai",
+            "X-Title": "MCQ Solver App"
+        }
+        
+        for attempt in range(3):
             try:
+                self.update_text(f"OpenRouter: Attempt {attempt + 1}...\n")
+                
                 response = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={GEMINI_API_KEY}",
+                    "https://openrouter.ai/api/v1/chat/completions",
                     headers=headers,
                     json=payload,
-                    timeout=30
+                    timeout=120
                 )
 
-                # Handle rate limits
-                if response.status_code == 429:
-                    wait = 2 ** attempt
-                    self.update_text(f"Rate limit hit. Retrying in {wait} sec...\n")
-                    time.sleep(wait)
+                # Log to file for debugging
+                with open("debug.log", "a") as f:
+                    f.write(f"\n--- Attempt {attempt + 1} ---\n")
+                    f.write(f"Status: {response.status_code}\n")
+                    f.write(f"Response: {response.text[:1000]}\n")
+
+                # Always check response content first
+                try:
+                    data = response.json()
+                except:
+                    msg = f"Invalid JSON response\nResponse: {response.text[:200]}\n"
+                    self.update_text(msg)
+                    with open("debug.log", "a") as f:
+                        f.write(f"JSON Parse Error: {response.text}\n")
                     continue
 
-                # Handle server downtime (503)
-                if response.status_code == 503:
-                    wait = (attempt + 1) * 3
-                    self.update_text(f"Server busy (503). Retrying in {wait} seconds...\n")
-                    time.sleep(wait)
-                    continue
+                # Log full response for debugging
+                if response.status_code != 200:
+                    if 'error' in data:
+                        error_msg = data['error'].get('message', str(data['error']))
+                        msg = f"OpenRouter - HTTP {response.status_code}\nError: {error_msg}\n"
+                    else:
+                        msg = f"OpenRouter - HTTP {response.status_code}\nResponse: {response.text[:300]}\n"
+                    self.update_text(msg)
+                    
+                    # Retry on 429/503
+                    if response.status_code in [429, 503]:
+                        wait = 2 ** attempt
+                        self.update_text(f"Retrying in {wait} seconds...\n")
+                        time.sleep(wait)
+                        continue
+                    break
 
-                response.raise_for_status()
-                data = response.json()
-                answer_text = data['candidates'][0]['content']['parts'][0]['text']
+                # Check for API errors in response
+                if 'error' in data:
+                    error_msg = data['error'].get('message', str(data['error']))
+                    self.update_text(f"API Error: {error_msg}\nRetrying...\n")
+                    time.sleep(2)
+                    continue
+                
+                if 'choices' not in data or not data['choices']:
+                    self.update_text(f"No response from API.\n")
+                    with open("debug.log", "a") as f:
+                        f.write(f"No choices. Data: {str(data)[:500]}\n")
+                    continue
+                
+                # Check if choice has content
+                choice = data['choices'][0]
+                if 'message' not in choice or 'content' not in choice['message']:
+                    self.update_text(f"Invalid response structure\n")
+                    with open("debug.log", "a") as f:
+                        f.write(f"Invalid structure. Choice: {str(choice)[:500]}\n")
+                    continue
+                    
+                answer_text = choice['message']['content']
 
                 # ✅ Log success
                 self.log_usage()
@@ -173,45 +229,30 @@ class OverlayApp:
                     f"Today: {today_count}\n"
                     f"Month: {month_count}\n"
                     f"90 Days: {last_90_count}\n"
+                    f"(OpenRouter)"
                 )
 
                 self.update_text(display)
                 return
 
+            except requests.exceptions.Timeout:
+                self.update_text(f"⏱️ Timeout. Retrying...\n")
+                time.sleep(5)
+            except requests.exceptions.ConnectionError as ce:
+                self.update_text(f"🌐 Connection error\nRetrying...\n")
+                time.sleep(5)
             except Exception as e:
-                self.update_text(f"Error: {str(e)}\nRetrying...\n")
+                msg = f"❌ {type(e).__name__}: {str(e)[:80]}\n"
+                self.update_text(msg)
+                with open("debug.log", "a") as f:
+                    f.write(f"Exception: {type(e).__name__}: {str(e)}\n")
                 time.sleep(3)
 
-        # ✅ Fallback to Flash model if Pro keeps failing
-        try:
-            self.update_text("Switching to backup model (gemini-1.5-flash)...\n")
-
-            response = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            answer_text = data['candidates'][0]['content']['parts'][0]['text']
-
-            self.log_usage()
-            today_count, month_count, last_90_count = self.get_usage_stats()
-
-            display = (
-                f"{answer_text}\n\n"
-                f"--- API Usage ---\n"
-                f"Today: {today_count}\n"
-                f"Month: {month_count}\n"
-                f"90 Days: {last_90_count}\n"
-                f"(⚡ Flash model was used as backup)"
-            )
-            self.update_text(display)
-
-        except Exception as e:
-            self.update_text("❌ Server unavailable. Please try again later.")
-            return
+        # ✅ All attempts exhausted
+        msg = "❌ OpenRouter failed.\n\n📋 Check debug.log for details\n\nPossible causes:\n- Invalid API key\n- No credits\n- Server issue\n\nTry: https://openrouter.ai/account/usage"
+        self.update_text(msg)
+        with open("debug.log", "a") as f:
+            f.write(f"\n=== ALL ATTEMPTS FAILED ===\n")
 
     def refresh(self):
         self.update_text("Overlay refreshed. Ready.")
